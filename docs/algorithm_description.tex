@@ -1,0 +1,222 @@
+\documentclass[12pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{amsmath}
+\usepackage{amssymb}
+
+\title{Wave6G Optimization Workflow: Language-Agnostic Specification}
+\author{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This companion note records the two core routines of the Wave6G pipeline using language-agnostic pseudocode.  Every step is described in terms of elementary operations (linear algebra, complex arithmetic, Adam-style optimisation) so the procedures can be reproduced in any programming environment.
+\end{abstract}
+
+\section{Notation}
+\begin{itemize}
+  \item $x \in \mathbb{R}^N$: real-valued signal window.
+  \item $L$: number of decomposition levels in the MERA hierarchy.
+  \item $\chi$: bond dimension (number of latent channels per scale).
+  \item $\chi_{\text{mid}}$: auxiliary bond dimension used inside disentangling stages.
+  \item $U = \{U^{(1)}, \dots, U^{(L)}\}$: learnable scale isometries.  Each $U^{(\ell)}$ is a rank-4 tensor with the orthonormality constraint $U^{(\ell)\dagger} U^{(\ell)} = I$ along the output leg.
+  \item $\lambda_{\text{sparse}}, \lambda_{\text{MSE}}$: non-negative weights for the sparsity and fidelity terms.
+  \item $\eta$: Adam learning rate.
+\end{itemize}
+
+Bond dimensions act as rank caps.  Flattening any tensor across a selected leg yields a matrix whose maximum rank equals the size of that leg.  A simple illustration is a matrix $M \in \mathbb{C}^{m \times n}$: its rank cannot exceed $\min(m,n)$, which are exactly the bond dimensions of its two indices.  In MERA, grouping the two child legs of $U^{(\ell)}$ on one axis and the parent leg on the other shows that $\chi$ limits how many independent mixtures of child subbands ascend to the next scale; larger $\chi$ therefore increases expressiveness.  For example, if $\chi=2$ then $\mathrm{rank}(U^{(\ell)}) \leq 2$ after matricisation, so only two independent combinations can be propagated upward; if $\chi=8$, up to eight combinations survive.  The same idea applies to $\chi_{\text{mid}}$ inside disentanglers, where it bounds how many intermediate “decorrelation” channels can be maintained before down-sampling.
+
+Levels are counted from the finest scale: level~$1$ is the first decomposition stage immediately after the raw window, whereas level~$L$ is the final (coarsest) scale after $L$ rounds of decimation.  Every MERA layer splits the signal into approximation (low-pass) and detail (high-pass) components on each child leg.  Before an isometry acts, the pipeline concatenates these paired approximation/detail vectors from both child legs into a single stacked vector $\mathbf{f}$; the rows of $U^{(\ell)}$ specify which blends of approximation and detail make it to the next (coarser) level.  Hence, increasing $\chi$ literally increases the number of distinct approximation/detail combinations that can be retained—see Appendices for concrete recipes.
+
+\section{Language-Agnostic MERA Optimisation}
+\begin{algorithm}[t]
+  \caption{Variational MERA-Wavelet Optimisation (Language-Agnostic)}
+  \label{alg:generic_opt}
+  \begin{algorithmic}[1]
+    \Require $x, L, \chi, \chi_{\text{mid}}, \texttt{numiter}, \eta, \lambda_{\text{sparse}}, \lambda_{\text{MSE}}, U_0$ (optional)
+    \State $U \gets U_0$ if provided; otherwise draw random complex tensors consistent with $(L, \chi, \chi_{\text{mid}})$ and project each via Algorithm~\ref{alg:generic_proj}
+    \State Configure Adam state $(m, v) \gets \textsc{InitialiseAdam}(U, \eta)$
+    \For{$k = 1$ to $\texttt{numiter}$}
+      \State $(a, \{d^{(\ell)}\}_{\ell=1}^L) \gets \textsc{MERAAnalyze}(x, U)$ \Comment{Forward MERA transform}
+      \State $\mathcal{L}_{\text{sparse}} \gets \frac{1}{L} \sum_{\ell=1}^L \|d^{(\ell)}\|_{1}$
+      \If{$\lambda_{\text{MSE}} > 0$}
+        \State $\hat{x} \gets \textsc{MERASynthesize}(a, \{d^{(\ell)}\}, U)$
+        \State $\mathcal{L}_{\text{MSE}} \gets \frac{1}{N} \|\hat{x} - x\|_2^2$
+      \Else
+        \State $\mathcal{L}_{\text{MSE}} \gets 0$
+      \EndIf
+      \State $\mathcal{L} \gets \lambda_{\text{sparse}} \mathcal{L}_{\text{sparse}} + \lambda_{\text{MSE}} \mathcal{L}_{\text{MSE}}$
+      \State $\nabla_U \gets \textsc{Backpropagate}(\mathcal{L}, U, x)$ \Comment{Reverse-mode AD or equivalent}
+      \State $U, m, v \gets \textsc{AdamUpdate}(U, \nabla_U, m, v, k)$
+      \For{$\ell = 1$ to $L$}
+        \State $U^{(\ell)} \gets \textsc{ProjectIsometry}(U^{(\ell)}, 1)$ \Comment{Algorithm~\ref{alg:generic_proj}}
+      \EndFor
+    \EndFor
+    \State \Return $U$, loss trace $\{\mathcal{L}_k\}_{k=1}^{\texttt{numiter}}$
+  \end{algorithmic}
+\end{algorithm}
+
+\paragraph{Implementation checklist.}
+\begin{itemize}
+  \item \textsc{InitialiseAdam}, \textsc{AdamUpdate}: any Adam implementation with bias correction is acceptable.
+  \item \textsc{Backpropagate}: a reverse-mode autodiff engine or manual gradient computation.
+  \item \textsc{MERAAnalyze}, \textsc{MERASynthesize}: must implement the forward and inverse MERA transforms using the current tensors $U$; both operate in complex arithmetic.
+\end{itemize}
+
+\section{Language-Agnostic Isometric Projection}
+\begin{algorithm}[t]
+  \caption{ProjectIsometry (Language-Agnostic)}
+  \label{alg:generic_proj}
+  \begin{algorithmic}[1]
+    \Require Tensor $T \in \mathbb{C}^{n_1 \times \cdots \times n_D}$, index $\alpha$ specifying the output leg
+    \State $\pi \gets$ permutation that moves axis $\alpha$ to the final position
+    \State $T_\pi \gets \textsc{PermuteDims}(T, \pi)$
+    \State $(n_{\text{row}}, n_{\text{col}}) \gets \left(\prod_{i=1}^{D-1} n_i^\pi, n_D^\pi\right)$
+    \State $A \gets \textsc{Reshape}(T_\pi, n_{\text{row}}, n_{\text{col}})$
+    \State $G \gets A^\dagger A$ \Comment{Complex Gram matrix}
+    \State $(Q, \Lambda) \gets \textsc{EigenDecompose}(G)$ with eigenvalues $\lambda_i$
+    \State $\tau \gets \max(\Lambda) \cdot \varepsilon$ \Comment{$\varepsilon$ is machine precision of $\Lambda$}
+    \State $\tilde{\Lambda}_{ii} \gets \begin{cases} \lambda_i^{-1/2}, & \lambda_i > \tau \\ 0, & \text{otherwise} \end{cases}$
+    \State $U_{\text{polar}} \gets A Q \tilde{\Lambda}$ \Comment{Polar factor $A (A^\dagger A)^{-1/2}$}
+    \State $U_\pi \gets \textsc{Reshape}(U_{\text{polar}}, n_1^\pi, \dots, n_D^\pi)$
+    \State $T_{\text{iso}} \gets \textsc{PermuteDims}(U_\pi, \pi^{-1})$
+    \State \Return $T_{\text{iso}}$
+  \end{algorithmic}
+\end{algorithm}
+
+\paragraph{Implementation checklist.}
+\begin{itemize}
+  \item Any eigenvalue routine that returns real non-negative eigenvalues for Hermitian matrices suffices.
+  \item If $\lambda_i$ is below the threshold, zeroing the inverse square root avoids numerical instability while preserving orthogonality for the remaining spectrum.
+  \item The output satisfies $T_{\text{iso}}^\dagger T_{\text{iso}} = I$ along the selected axis.
+\end{itemize}
+
+\section{Reproducibility Notes}
+\begin{itemize}
+  \item The pseudocode assumes complex tensors.  Implementations that start from real-valued coefficients can promote them to complex type with zero imaginary part.
+  \item Random initialisation should be seeded explicitly to guarantee reproducibility across runs and languages.
+  \item Storing the sequence of losses $\{\mathcal{L}_k\}$ and the final projected tensors $U$ is sufficient to resume training or benchmark against other methods.
+\end{itemize}
+
+\appendix
+\section{Worked Example with $\chi = 2$}
+\label{sec:lang-chi-two}
+To illustrate the impact of the bond dimension, consider one MERA level with $\chi = 2$.  The steps below can be implemented in any language:
+\begin{enumerate}
+  \item Run the MERA analysis until level $1$ to obtain two down-sampled child vectors (each of length $2$).
+  \item Interleave these coefficients into $\mathbf{f} = (f_{1\uparrow}, f_{1\downarrow}, f_{2\uparrow}, f_{2\downarrow})^\top \in \mathbb{C}^{4}$, keeping the approximation ($\uparrow$) / detail ($\downarrow$) order used internally by the pipeline.
+  \item Reshape the learned isometry into the matrix
+  \[
+  U =
+  \begin{bmatrix}
+  0.7 & 0.0 & 0.7 & 0.0 \\
+  0.0 & 0.7 & 0.0 & -0.7
+  \end{bmatrix}.
+  \]
+  \item Multiply $\mathbf{f}$ by $U$.  For $\mathbf{f} = (1, 0, 0, 0)^\top$, the parent output is $(0.7, 0)^\top$; for $\mathbf{f} = (0, 1, 0, 1)^\top$, the output is $(0, 0)^\top$.
+\end{enumerate}
+Because $U$ has only two rows, it can carry at most two independent combinations of the four child coefficients.  Enlarging $\chi$ would add more parent rows and raise the rank ceiling accordingly.
+
+\section{Worked Example with $\chi = 4$}
+Repeat the experiment with $\chi = 4$:
+\begin{enumerate}
+  \item Reuse the same stacked vector $\mathbf{f}$ (the approximation/detail ordering remains identical).
+  \item Reshape the isometry into
+  \[
+  U_{(4)} =
+  \begin{bmatrix}
+  0.5 & 0.0 & 0.5 & 0.0 \\
+  0.0 & 0.5 & 0.0 & 0.5 \\
+  0.5 & 0.0 & -0.5 & 0.0 \\
+  0.0 & 0.5 & 0.0 & -0.5
+  \end{bmatrix}.
+  \]
+  \item Evaluate $U_{(4)} \mathbf{f}$.  For $\mathbf{f} = (1, 0, 0, 0)^\top$, the result is $(0.5, 0.0, 0.5, 0.0)^\top$, while $\mathbf{f} = (0, 1, 0, -1)^\top$ yields $(0.0, 1.0, 0.0, -1.0)^\top$.
+\end{enumerate}
+The four rows now permit rank up to $4$, so four independent mixtures of the child coefficients can propagate to the next scale.
+
+\section{Worked 8-Sample Signal}
+To make the mechanics reproducible in any environment, pick the concrete window
+\[
+x = (1.2,\; 0.1,\; -0.6,\; 0.4,\; 0.9,\; -0.2,\; 0.3,\; -0.5).
+\]
+\begin{enumerate}
+  \item \textbf{Level-1 decomposition.}  Because level~1 is the stage immediately after the raw signal, apply the Haar filters
+  \[
+  \text{approx}_k = \frac{x_{2k-1} + x_{2k}}{\sqrt{2}}, \qquad
+  \text{detail}_k = \frac{x_{2k-1} - x_{2k}}{\sqrt{2}}
+  \]
+  to obtain
+  \[
+  \text{approx} = (0.9192,\; -0.1414,\; 0.4950,\; -0.1414),\quad
+  \text{detail} = (0.7778,\; -0.7071,\; 0.7778,\; 0.5657).
+  \]
+  \item \textbf{Pass approximations upward.}  Drop the detail coefficients (they exit the tree) and feed the stacked approximations to the coarse layer:
+  \[
+  \mathbf{f}_a = (a^{(1)}_1,\; a^{(1)}_2)^\top = (0.9192,\; -0.1414)^\top.
+  \]
+  \item \textbf{Apply $U_{(2)}$.}  Multiplying by a $\chi = 2$ matrix such as
+  \[
+  \begin{bmatrix}
+    0.8 & 0.6 \\
+    -0.6 & 0.8
+  \end{bmatrix}
+  \]
+  gives $U_{(2)} \mathbf{f}_a = (0.6500,\; -0.8716)^\top$.  Because $U_{(2)}$ has two rows, only two parent channels (coarse approximation/detail) survive to level~2.
+  \item \textbf{Apply $U_{(4)}$.}  If the coarse isometry had $\chi = 4$, it would be a \(4 \times 2\) matrix with orthonormal rows, so four coarse channels would be emitted instead.
+\end{enumerate}
+The same steps can be repeated for the remaining child legs (from samples 5--8).  At the next level, these parent outputs become the new inputs, and the selected $\chi$ again determines how many approximation/detail mixtures travel upward.
+
+\section{Worked 4-Sample, Two-Level Pipeline}
+For a fully explicit run-through, use the four-sample window
+\[
+x = (1.0,\; 0.2,\; -0.4,\; 0.8),
+\]
+set $L = 2$, and keep $\chi = 2$.  The computation proceeds as follows:
+\begin{enumerate}
+  \item \textbf{Level-1 Haar decomposition.}  Compute
+  \[
+  a^{(1)}_1 = 0.8485,\; d^{(1)}_1 = 0.5657,\qquad
+  a^{(1)}_2 = 0.2828,\; d^{(1)}_2 = -0.8485.
+  \]
+  \item \textbf{Level-2 input.}  Only approximations flow upward, so set $\mathbf{f}^{(2)} = (a^{(1)}_1,\; a^{(1)}_2)^\top = (0.8485,\; 0.2828)^\top$.
+  \item \textbf{Apply $U^{(2)}$.}  Choose any $2 \times 2$ isometry, e.g.
+  \[
+  U^{(2)} =
+  \begin{bmatrix}
+    0.8 & 0.6 \\
+    -0.6 & 0.8
+  \end{bmatrix},
+  \]
+  to get the coarse-scale channels
+  \[
+  U^{(2)} \mathbf{f}^{(2)} = (1.2275,\; 0.3168)^\top.
+  \]
+\end{enumerate}
+Because $\chi = 2$ everywhere, each level emits two channels; bumping $\chi$ to $4$ would double the number of coarse-scale channels produced at every stage.
+
+\subsection*{Variation: $\chi = 4$ at the Top}
+Setting $\chi = 4$ for $U_2$ while keeping only two approximations available forces a \(4 \times 2\) isometry, e.g.
+\[
+U_2^{(\chi=4)} =
+\begin{bmatrix}
+  0.5 & 0.5 \\
+  0.5 & -0.5 \\
+  0.5 & 0.5 \\
+  -0.5 & 0.5
+\end{bmatrix}.
+\]
+Multiplying yields $U_2^{(\chi=4)} \mathbf{f}^{(2)} = (0.5656,\; 0.2828,\; 0.5656,\; -0.2828)^\top$, i.e., four weighted copies of the same two inputs.  The rank is still at most 2, so this configuration adds redundancy but no new information unless additional independent approximations are provided.
+
+To align with the diagram shown in the prompt, map the computed coefficients as
+\begin{align*}
+  a^{(1)}_1 &= 0.8485, & d^{(1)}_1 &= 0.5657 \quad &&\text{(outputs of the left $U_1$ connected to $x_1, x_2$)},\\
+  a^{(1)}_2 &= 0.2828, & d^{(1)}_2 &= -0.8485 \quad &&\text{(outputs of the right $U_1$ connected to $x_3, x_4$)},\\
+  a^{(2)}_{\text{final}} &= 1.2275, & d^{(2)}_{\text{final}} &= 0.3168 \quad &&\text{(outputs of the top $U_2$)}.
+\end{align*}
+Each label in the figure therefore corresponds to one numeric entry in the worked example, showing explicitly how the MERA wires transport approximation/detail information upward.
+
+\end{document}

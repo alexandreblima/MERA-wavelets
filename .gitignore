@@ -1,0 +1,40 @@
+# OS / Finder metadata
+.DS_Store
+**/.DS_Store
+._*
+Thumbs.db
+
+# R session files
+.Rhistory
+.RData
+.Rproj.user/
+
+# LaTeX aux files (keep PDFs in results/)
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+*.fdb_latexmk
+*.fls
+*.lof
+*.lot
+*.bbl
+*.blg
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDEs/editors (keep VS Code settings committed)
+.idea/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Envs
+.env
+.venv/
+venv/
+
+# Julia (avoid blocking user-wide folder)
+.julia/

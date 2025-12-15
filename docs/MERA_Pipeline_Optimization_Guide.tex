@@ -1,0 +1,190 @@
+\documentclass[conference]{IEEEtran}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[english]{babel}
+\usepackage{amsmath, amsfonts, amssymb}
+\usepackage{enumitem}
+\usepackage{hyperref}
+
+\begin{document}
+
+\title{MERA Pipeline Optimization Guide}
+\author{Wave6G Research Team}
+\maketitle
+
+\begin{abstract}
+This document provides a practitioner-oriented description of the MERA
+optimization pipeline implemented in Wave6G.jl. It explains how windowed data
+are prepared, how optimization stages are scheduled, how the variational loop
+interacts with automatic differentiation, and how orthogonality constraints are
+enforced while allowing both rotation and reflection components of $O(2)$. The
+guide consolidates the conventions used in the latest code base and highlights
+diagnostic steps to verify that training remains stable and reproducible.
+\end{abstract}
+
+\section{Introduction}
+Wave6G couples Multiscale Entanglement Renormalization Ansatz (MERA) tensor
+networks with orthonormal wavelets to analyze high-resolution network telemetry.
+Because each traffic trace can span millions of samples, the optimization runs
+window by window and relies on a staged schedule to balance reconstruction
+accuracy and sparsity. The Julia implementation exposes a full API
+(\texttt{prepare\_variational\_state}, \texttt{optimize\_variational\_schedule!},
+\texttt{learn\_wavelet\_filters}) that automates those steps. This guide expands
+the inline comments with a global narrative intended for engineers who want to
+modify or reimplement the pipeline.
+
+\section{Data Preparation}
+\subsection{Normalization}
+Every trace is optionally standardized via a z-score:
+\begin{enumerate}[label=\alph*.]
+    \item convert the samples to \texttt{Float64} to avoid precision loss;
+    \item compute $\mu$ and $\sigma$; guard against $\sigma \approx 0$ by
+    clamping to $1.0$;
+    \item cache $(\mu, \sigma)$ inside the variational state so reconstruction
+    in the original scale is possible.
+\end{enumerate}
+This normalization is implemented in \texttt{Wave6G.zscore} and reused by the
+dataset utilities under \texttt{MAWI.jl}.
+
+\subsection{Window Extraction}
+Signals are chunked into dyadic windows using
+\texttt{overlap\_windows}/\texttt{window\_series}. The pipeline assumes even
+window lengths so each MERA level can down-sample by a factor of two. When the
+trace contains missing values, preprocessing must interpolate or discard the
+affected regions before invoking the optimizer.
+
+\section{Variational State Initialization}
+\subsection{Warm Starts}
+The helper \texttt{\_haar\_tensors} produces deterministic Haar tensors for
+$\chi = \chi_{\text{mid}} = 2$. They already contain reflection blocks
+($\det = -1$) and therefore certify that the implementation accesses the full
+$O(2)$ group. For other bond dimensions the state falls back to
+\texttt{init\_random\_tensors}, which draws Gaussian entries and immediately
+projects them onto the isometry manifold.
+
+\subsection{State Structure}
+\texttt{VariationalState} keeps the normalized data, statistics, dimensions,
+current tensors $(wC, vC, uC)$, the latest loss, and a history vector. The
+history records each optimization stage along with the hyperparameters used to
+reproduce the run.
+
+\section{Stage Scheduling}
+A schedule is a vector of named tuples such as
+\[
+(numiter=200, lr=5\times10^{-3}, init=:haar,\; \chi=2,\; \chi_{\text{mid}}=2)
+\]
+The scheduler operates as follows:
+\begin{enumerate}[label=\arabic*.]
+    \item Merge base options with per-stage overrides, including optional fields
+    for dimensions, seeds, reinitialization flags, and warm-start modes.
+    \item Decide whether tensors are reused or regenerated. Dimension changes or
+    explicit \texttt{reinit=true} always trigger fresh tensors.
+    \item Invoke \texttt{optimize\_wavelet\_sparsity} with the chosen tensors,
+    data window, and stage options.
+    \item Store the returned tensors in the state, update the loss, and append a
+    history record that includes $(L, \chi, \chi_{\text{mid}}, numiter, lr,
+    init)$.
+\end{enumerate}
+Because the stage handler is pure Julia, callers can provide arbitrary keyword
+lists (\texttt{opts}) to experiment with additional loss weights (e.g., MSE,
+regularizers) without modifying the schedule structure.
+
+\section{Variational Optimization Loop}
+For each stage, the optimizer executes $N$ iterations (default $N=200$):
+\begin{enumerate}[label=\roman*.]
+    \item \textbf{Forward pass.} Run \texttt{mera\_analyze} to compute
+    approximation/detail coefficients for every level.
+    \item \textbf{Loss construction.} Evaluate the sparsity loss (mean absolute
+    value of all detail coefficients) and, if requested, the reconstruction MSE.
+    \item \textbf{Gradient computation.} Use \texttt{Flux.withgradient} and
+    Zygote to differentiate the loss with respect to $w$ and $v$ tensors. Nil
+    gradients are replaced with zero arrays to safeguard the optimizer state.
+    \item \textbf{Parameter update.} Apply Adam to the tuple
+    $(wC = wC, vC = vC)$ and refresh the optimizer state.
+    \item \textbf{Projection.} Project each tensor back onto the isometric
+    manifold (next section) to ensure the MERA constraints hold after each step.
+    \item \textbf{Logging.} Print the loss every fixed percentage of progress
+    (1\%, 10\%, 100\%) and retain the final loss for the stage summary.
+\end{enumerate}
+CUDA acceleration is enabled automatically when the input tensors live on the
+GPU. The code optionally distributes the projection work across multiple CUDA
+streams or CPU threads to reduce wall time for large $L$.
+
+\section{Isometry Projection and $O(2)$ Handling}
+\subsection{Projection Routine}
+The routine (\texttt{TensorUpdateSVD}) enforces orthogonality without forcing
+the determinant to $+1$, preserving the two connected components of $O(2)$. The
+steps are:
+\begin{enumerate}[label=\alph*.]
+    \item Permute the tensor so that the axis being constrained moves to the
+    last dimension; reshape into a matrix $A$.
+    \item Form the Hermitian Gram matrix $G = A^{\dagger}A$ and compute its
+    eigendecomposition $G = Q \Lambda Q^{\dagger}$.
+    \item Build $\Lambda^{-1/2}$ by taking inverse square roots of the eigenvalues
+    with numerical safeguards for tiny values.
+    \item Compute $U = A Q \Lambda^{-1/2}$, reshape $U$ back to the original
+    tensor dimensions, and undo the permutation.
+\end{enumerate}
+Because the transformation is a polar factorization, $\det(U)$ keeps the sign of
+$\det(A)$, so reflections survive intact.
+
+\subsection{Determinant Diagnostics}
+A lightweight diagnostic function can iterate over $wC$ slices, convert the
+leading $2\times 2$ block to a dense matrix, and print
+$\det(\text{block})$. This confirms whether the learned filters include Haar-like
+reflections. The procedure is fast enough to run after every training session
+and is recommended when experimenting with new initializers or loss weights.
+
+\section{Verification and Testing}
+\subsection{Haar Reconstruction}
+Use \texttt{\_haar\_tensors} as initialization, run \texttt{mera\_analyze} on a
+test signal, and immediately synthesize it. The reconstruction error should be
+close to machine precision, demonstrating that the pipeline can reproduce the
+canonical Haar filters (determinant $-1$).
+
+\subsection{Parseval and Energy Checks}
+\texttt{parseval\_test} verifies that energy is preserved across MERA analysis
+and synthesis. This is a practical guard against numerical drift when changing
+precision modes or adjusting GPU kernels.
+
+\subsection{Sparsity Metrics}
+After optimization, examine \texttt{state.history}. Each entry stores the stage
+index, hyperparameters, and final loss, which is dominated by the sparsity term
+when the reconstruction weight is zero. These logs help track convergence across
+windows.
+
+\section{Reproducibility Tips}
+\begin{enumerate}[label=\arabic*.]
+    \item \textbf{Seeds.} Provide per-stage seeds when deterministic behavior is
+    required; otherwise each call to the initializer draws new tensors.
+    \item \textbf{Precision.} Mixed precision can be toggled via
+    \texttt{enable\_mixed\_precision!}. When debugging numerical issues, run in
+    pure \texttt{Float64} mode to isolate rounding artifacts.
+    \item \textbf{Caching.} Wave6G includes a simple computation cache. Clear it
+    using \texttt{clear\_computation\_cache!()} when benchmarking to avoid stale
+    results.
+\end{enumerate}
+
+\section{Summary}
+The Wave6G MERA pipeline combines staged scheduling, a variational optimization
+loop, and a determinant-preserving projection routine. The system is designed to
+learn adaptive wavelets that satisfy perfect reconstruction, Parseval's
+identity, and sparsity objectives simultaneously. By following the procedures
+documented here—data preparation, scheduling, optimization, projection, and
+diagnostics—practitioners can reproduce the existing results, extend the code to
+new datasets, or port the algorithm to another language while maintaining the
+full $O(2)$ capability required by classical wavelets such as Haar.
+
+\bibliographystyle{ieeetr}
+\begin{thebibliography}{1}
+\bibitem{evenbly2016}
+G.~Evenbly and G.~Vidal, ``Algorithms for entanglement renormalization,''
+\emph{Physical Review B}, vol.~79, no.~14, p.~144108, 2009.
+\bibitem{mallat1999}
+S.~Mallat, \emph{A Wavelet Tour of Signal Processing}. Academic Press, 1999.
+\bibitem{wave6gdocs}
+Wave6G Development Team, ``Wave6G.jl Source Documentation,'' 2024.
+\end{thebibliography}
+
+\end{document}

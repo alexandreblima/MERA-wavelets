@@ -1,0 +1,172 @@
+\documentclass[12pt,onecolumn]{IEEEtran}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[english]{babel}
+\usepackage{amsmath, amsfonts}
+\usepackage{enumitem}
+
+\begin{document}
+
+\title{Plain-English Description of the MERA Optimization Pipeline}
+\author{Wave6G Team}
+\maketitle
+
+\begin{abstract}
+This guide narrates the MERA-wavelet optimization pipeline in plain English.
+It expands the original summary with details about data preparation, stage
+scheduling, variational updates, orthogonal projections, determinant handling,
+and diagnostic checks. The goal is to give enough structure for a reader to
+reconstruct the pseudocode or adapt the logic to a different stack without
+reading the full Julia implementation.
+\end{abstract}
+
+\section{Pipeline Overview}
+The Wave6G pipeline learns MERA filters window by window on a network-traffic
+time series. For each window, a schedule of stages dictates how many iterations
+to run, which hyperparameters to use, and whether tensors should be reused or
+reinitialized. Within every stage the algorithm executes a variational update:
+\begin{enumerate}[label=\alph*.]
+    \item evaluate the MERA analysis to extract approximation/detail
+    coefficients;
+    \item compute sparsity and reconstruction objectives;
+    \item update the tensors with Adam;
+    \item project the tensors back onto the MERA isometric manifold so both
+    $\det=+1$ and $\det=-1$ branches of $O(2)$ remain feasible.
+\end{enumerate}
+The cycle repeats for all stages of a window and then for all windows of the
+trace, producing tensors, losses, and metadata suitable for inference or
+further analysis.
+
+\section{Data Preparation and Windowing}
+\begin{enumerate}[label=\arabic*.]
+    \item \textbf{Normalize the trace.} Apply a z-score (\texttt{zscore}) to the
+    raw samples or skip normalization if downstream metrics expect absolute
+    scales. Normalization statistics are stored in the state for later inverse
+    transforms.
+    \item \textbf{Generate dyadic windows.} Slide a fixed-size window with optional
+    overlap across the normalized series. Each window length must be even so
+    that MERA down-sampling works at all levels.
+    \item \textbf{Prepare the variational state.} For every window build (or reuse)
+    a \texttt{VariationalState} containing the data vector, tensor dimensions
+    $(L, \chi, \chi_{\text{mid}})$, warm-start tensors (Haar or random), and an
+    empty history log.
+\end{enumerate}
+
+\section{Stage Scheduling Procedure}
+Given a populated state and a user-specified schedule (a vector of named tuples),
+the scheduler executes the following logic for each window:
+\begin{enumerate}[label=\arabic*.]
+    \item \textbf{Sync data.} Replace the window stored in the state if new data
+    were provided by the caller.
+    \item \textbf{Iterate over stages.} For every stage entry:
+    \begin{enumerate}[label*=\arabic*.]
+        \item Start from the base optimizer options (iteration budget, learning
+        rate, loss weights, CUDA flags).
+        \item Overlay all per-stage overrides: iteration count, $L$, $\chi$,
+        $\chi_{\text{mid}}$, learning rate, random seed, reinitialization flag,
+        warm-start mode, and any additional keyword dictionary.
+        \item Decide the tensors to feed into the optimizer. Reuse the tensors
+        contained in the state when dimensions match and reinitialization is not
+        forced; otherwise invoke the requested initializer (Haar or random) to
+        produce fresh tensors projected onto the isometry manifold.
+        \item Call the variational optimizer with the selected tensors, options,
+        and data for the window.
+        \item Overwrite the state with the tensors and loss returned by the
+        optimizer, append an entry to the history, and continue with the next
+        stage.
+    \end{enumerate}
+\end{enumerate}
+
+\section{Variational Optimization Cycle}
+Inside a stage, the optimizer performs the following loop for the requested
+number of iterations:
+\begin{enumerate}[label=\arabic*.]
+    \item \textbf{Forward analysis.} Run \texttt{mera\_analyze} on the current
+    tensors to obtain approximation/detail coefficients for every MERA level.
+    \item \textbf{Sparse penalty.} Compute the sparsity term by taking the mean
+    absolute value of all detail coefficients (the $\ell_{1}$ density).
+    \item \textbf{Reconstruction penalty.} If the stage enables reconstruction,
+    run \texttt{mera\_synthesize}, subtract the original window, and accumulate
+    the mean squared error.
+    \item \textbf{Loss aggregation.} Combine the sparsity and reconstruction
+    terms using the stage weights. The result is the scalar loss fed to AD.
+    \item \textbf{Gradient update.} Differentiate the loss via Zygote, sanitize
+    missing gradients, and apply Adam to update $w$ and $v$ tensors (and
+    optionally $u$, depending on the engine configuration).
+    \item \textbf{Projection.} After every gradient step, project each tensor
+    back onto the isometric manifold using the routine in the next section.
+\end{enumerate}
+Progress logs report losses at regular intervals, and the final tensors/loss are
+returned to the scheduler once the loop completes.
+
+\section{Isometry Projection Routine}
+The projection routine enforces MERA constraints while keeping access to the
+entire $O(2)$ manifold (rotations and reflections). For each tensor that needs
+projection:
+\begin{enumerate}[label=\arabic*.]
+    \item Select the axis that must stay orthonormal (e.g., the output leg of an
+    isometry or disentangler).
+    \item Permute the tensor so the chosen axis becomes the trailing dimension.
+    \item Reshape the permuted tensor into a matrix whose columns correspond to
+    that axis.
+    \item Form the Gram matrix $G = A^{\dagger} A$.
+    \item Compute the eigendecomposition of $G$.
+    \item Build a diagonal matrix with the inverse square roots of the
+    eigenvalues, clamping near-zero values to zero for numerical stability.
+    \item Multiply $A$ by the eigenvectors and the diagonal scaling to obtain an
+    orthonormal matrix that preserves the original determinant sign (both
+    $+1$ and $-1$ remain valid).
+    \item Reshape the result back to the original tensor dimensions and undo the
+    permutation.
+\end{enumerate}
+Because the projection never forces $\det=+1$, reflections (needed for Haar and
+other classical wavelets) persist naturally.
+
+\section{Determinant Handling and Diagnostics}
+\begin{enumerate}[label=\arabic*.]
+    \item \textbf{Initialization.} Haar warm starts explicitly encode
+    $\det=-1$ blocks, ensuring the pipeline spans both components of $O(2)$.
+    Random initialization plus projection also yields determinants near $\pm1$.
+    \item \textbf{Monitoring.} A lightweight diagnostic function can slice the
+    leading $2\times2$ block of each isometry, compute its determinant, and
+    report whether reflections are present. Running this after optimization
+    validates that the projection did not collapse the solution set.
+    \item \textbf{Optional explicit parameterization.} If desired, tensors may
+    be reparameterized with angles $\theta$ and discrete flags $\kappa\in\{-1,
+    +1\}$ or with an unconstrained $2\times2$ block projected via SVD. In all
+    cases, the projection routine above keeps the determinant intact.
+\end{enumerate}
+
+\section{Verification Steps}
+\begin{enumerate}[label=\arabic*.]
+    \item \textbf{Haar check.} Load the Haar warm-start tensors, extract the
+    first $2\times2$ block, and confirm it equals $\frac{1}{\sqrt{2}}
+    \begin{bmatrix}1 & 1\\ 1 & -1\end{bmatrix}$ with $\det=-1$.
+    \item \textbf{Parseval/orthogonality.} Run \texttt{parseval\_test} or an
+    equivalent energy conservation check to ensure the learned filters preserve
+    norms within numerical tolerance.
+    \item \textbf{Window reconstruction.} For a subset of windows, perform
+    analysis followed by synthesis and measure the reconstruction error; values
+    near machine precision confirm perfect reconstruction.
+    \item \textbf{Sparsity tracking.} Inspect per-stage sparsity losses stored in
+    the history to verify that the variational objective behaves as expected.
+\end{enumerate}
+
+\section{Putting Everything Together}
+Processing an entire trace consists of the following nested structure:
+\begin{enumerate}[label=\arabic*.]
+    \item Generate or stream windows and prepare/refresh the variational state.
+    \item For each window run the stage scheduler, which in turn calls the
+    variational optimizer for each stage.
+    \item Inside the optimizer iterate: analyze, compute losses, update with
+    Adam, project, and log progress.
+    \item After all stages, store the resulting tensors, determinant diagnostics,
+    and losses. Move to the next window until the trace is exhausted.
+\end{enumerate}
+The enumerated routines above map directly to imperative pseudocode: each list
+represents a loop, and each bullet corresponds to a helper function or block of
+statements. Together they form a self-contained description of the MERA
+optimization pipeline suitable for reimplementation or auditing.
+
+\end{document}

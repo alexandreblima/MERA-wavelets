@@ -1,0 +1,112 @@
+\documentclass[12pt,a4paper]{article}
+
+% --- Essential Packages ---
+\usepackage[utf8]{inputenc}    % Allows UTF-8 input
+\usepackage[T1]{fontenc}       % Improves font rendering
+\usepackage[margin=1in]{geometry} % Defines 1-inch margins
+
+% --- Math Packages ---
+\usepackage{amsmath}           % Advanced math functions
+\usepackage{amssymb}           % Math symbols (like \mathbb{R})
+
+% --- Other ---
+\usepackage{graphicx}          % To include images
+\usepackage{hyperref}          % For links (if needed)
+
+% --- Document Information ---
+\title{Polar Decomposition: Computation via SVD and Application as a Retraction}
+\author{}
+\date{\today}
+
+% ==========================================================
+% BEGIN DOCUMENT
+% ==========================================================
+\begin{document}
+	
+	\maketitle
+	
+	\begin{abstract}
+		This document provides a technical overview of the Polar Decomposition, a fundamental concept in linear algebra. We detail its mathematical definition, explain the standard computational method for obtaining it using the Singular Value Decomposition (SVD), and, most importantly, describe its application as a ``retraction'' operation in Riemannian manifold optimization, specifically for the orthogonal group $\mathcal{O}(n)$.
+	\end{abstract}
+	
+	% --- SECTION 1: DEFINITION ---
+	\section{Definition of the Polar Decomposition}
+	
+	The Polar Decomposition is a factorization of a square matrix $A$ into two separate components: a pure rotation/reflection part and a pure stretching/shrinking part.
+	
+	For any square matrix $A \in \mathbb{R}^{n \times n}$, its polar decomposition is given by:
+	
+	\begin{equation}
+		A = U P
+	\end{equation}
+	
+	Where the components $U$ and $P$ have distinct mathematical properties:
+	
+	\begin{itemize}
+		\item \textbf{$U$ is an orthogonal matrix.} It satisfies the condition $U^\top U = U U^\top = \mathbf{I}$ (where $\mathbf{I}$ is the identity matrix). This matrix represents the pure rotation (or reflection) part of $A$. It does not change the volume or length of vectors, only their orientation.
+		
+		\item \textbf{$P$ is a symmetric positive semi-definite matrix.} It satisfies $P = P^\top$ and all its eigenvalues are non-negative ($\lambda_i \ge 0$). This matrix represents the stretching (or shrinking) part of $A$. It does not rotate the space, only deforms it along its orthogonal axes.
+	\end{itemize}
+	
+	Intuitively, the polar decomposition tells us that any linear transformation (represented by $A$) can be broken down into two actions: first, stretch the space (with $P$), and then, rotate it (with $U$).
+	
+	% 
+	
+	% --- SECTION 2: COMPUTATION VIA SVD ---
+	\section{Computation via Singular Value Decomposition (SVD)}
+	
+	While the definition $A=UP$ is elegant, it does not tell us how to find $U$ and $P$ in practice. The most robust and standard computational method for finding the polar decomposition is through the Singular Value Decomposition (SVD).
+	
+	The process is as follows:
+	
+	\begin{enumerate}
+		\item \textbf{Compute the SVD of $A$:} First, we decompose the matrix $A$ using SVD:
+		\begin{equation}
+			A = W \Sigma V^\top
+		\end{equation}
+		Where $W$ and $V$ are orthogonal matrices ($W^\top W = I$, $V^\top V = I$) and $\Sigma$ is a diagonal matrix containing the singular values of $A$.
+		
+		\item \textbf{Construct $U$ and $P$:} Once we have $W$, $\Sigma$, and $V$, we can construct $U$ and $P$ directly:
+		\begin{equation}
+			U = W V^\top
+		\end{equation}
+		\begin{equation}
+			P = V \Sigma V^\top
+		\end{equation}
+	\end{enumerate}
+	
+	This approach is preferred because the SVD is numerically stable, and its components ($W, V, \Sigma$) give us $U$ and $P$ directly.
+	
+	% --- SECTION 3: APPLICATION AS A RETRACTION ---
+	\section{Application: Polar Decomposition as a Retraction}
+	
+	In the optimization of neural networks or physical models, we often want a parameter matrix $U_\ell$ to remain orthogonal (i.e., $U_\ell \in \mathcal{O}(n)$) during training. $\mathcal{O}(n)$ is a Riemannian manifold (a curved space).
+	
+	\subsection{The Problem: The Drift}
+	
+	During training, we calculate a gradient $\nabla \mathcal{L}$ to update our parameters. A naive (Euclidean) update would be:
+	
+	\begin{equation}
+		A = U_\ell - \eta \nabla \mathcal{L}
+	\end{equation}
+	
+	The problem is that even if $U_\ell$ is perfectly orthogonal, the new matrix $A$ (after the gradient step) will almost certainly not be orthogonal. It will have drifted off the manifold $\mathcal{O}(n)$. This is called "drift" and it breaks the model's mathematical guarantees.
+	
+	\subsection{The Solution: Retraction}
+	
+	To fix this, we need a retraction operation, which pulls the matrix $A$ back to the nearest point on the manifold $\mathcal{O}(n)$.
+	
+	The polar decomposition is the canonical (and most popular) retraction for the orthogonal group.
+	
+	The process is:
+	\begin{enumerate}
+		\item We take the naive Euclidean step to get the matrix $A = U_\ell - \eta \nabla \mathcal{L}$.
+		\item We apply the polar decomposition to $A$: $A = U P$.
+		\item We \textbf{discard} the stretching part $P$, which represents the error or drift off the manifold.
+		\item We \textbf{keep} the rotation part $U$, which is, by definition, the closest orthogonal matrix to $A$ (in terms of the Frobenius norm).
+		\item Our new, updated parameter is $U_{\ell+1} = U$.
+	\end{enumerate}
+	
+	By applying this retraction (polar decomposition) at every training step, we guarantee that the parameters $U_\ell$ remain in $\mathcal{O}(n)$ throughout the entire optimization. This allows us to maintain structural guarantees (like energy conservation or perfect reconstruction) by construction.
+	
+\end{document}

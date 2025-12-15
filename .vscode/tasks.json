@@ -1,0 +1,27 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run: MERA MAWI (smoke)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"chmod +x scripts/run_mera_mawi.sh && scripts/run_mera_mawi.sh --data=data/small_test.csv --window-size=256 --step=256 --num-windows=2 --retains=0.01,0.02,0.05,0.1 --mera-L=3 --mera-chi=2 --mera-chimid=2 --stage1-iters=1 --stage2-iters=1 --output=results/_task_smoke.csv --warm-start-haar --train"
+			],
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Run: MERA MAWI (parallel, paper)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"chmod +x scripts/run_mera_mawi.sh && scripts/run_mera_mawi.sh --data=data/202301131400_bytes_1ms.csv --window-size=1024 --step=1024 --num-windows=10 --retains=0.01,0.02,0.05,0.1 --mera-L=5 --mera-chi=2 --mera-chimid=2 --preset=paper --output=results/_task_parallel_paper.csv --warm-start-haar --seed=12345 --pin-threads"
+			],
+			"problemMatcher": [],
+			"group": "build"
+		}
+	]
+}
